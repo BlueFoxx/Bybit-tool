@@ -2,168 +2,215 @@ export const runtime = "edge";
 
 import { NextRequest, NextResponse } from "next/server";
 
-const BYBIT_BASE = "https://api.bybit.com/v5/market/tickers";
+const BYBIT_API = "https://api.bybit.com/v5/market";
+const PROXY_API = "https://api.allorigins.win/raw?url=";
 
-interface BybitTicker {
-  symbol: string;
-  lastPrice: string;
-  prevPrice24h: string;
-  price24hPcnt: string;
-  highPrice24h: string;
-  lowPrice24h: string;
-  turnover24h: string;
-  volume24h: string;
-  markPrice?: string;
-  indexPrice?: string;
-  openInterest?: string;
-  openInterestValue?: string;
-  fundingRate?: string;
-  nextFundingTime?: string;
-  bid1Price: string;
-  ask1Price: string;
+const STABLECOINS = new Set([
+  "USDT", "USDC", "DAI", "TUSD", "BUSD", "USDP", "FDUSD",
+  "USDE", "PYUSD", "RLUSD", "FRAX", "USDD", "CRVUSD", "EURC",
+]);
+
+const STABLE_PATTERN = new Set([
+  "USDT", "USDC", "DAI", "TUSD", "BUSD", "USDP", "FDUSD",
+  "USDE", "PYUSD", "RLUSD", "FRAX", "USDD", "CRVUSD", "EURC",
+]);
+
+const REQ_HEADERS: Record<string, string> = {
+  Accept: "application/json",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Cache-Control": "no-cache",
+  "User-Agent":
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+};
+
+/* ------------------------------------------------------------------ */
+/*  Types                                                              */
+/* ------------------------------------------------------------------ */
+
+interface TimeframeChanges {
+  m5: number | null;
+  m10: number | null;
+  m15: number | null;
+  m30: number | null;
+  h1: number | null;
+  h12: number | null;
+  h24: number;
 }
 
 export interface MarketTicker {
   symbol: string;
   price: number;
-  change24h: number;
-  changePercent: number;
-  high24h: number;
-  low24h: number;
-  volume24h: number;
   turnover24h: number;
+  changes: TimeframeChanges;
   markPrice?: number;
-  indexPrice?: number;
-  openInterest?: number;
   openInterestValue?: number;
   fundingRate?: number;
-  nextFundingTime?: string;
 }
 
-const REQUEST_HEADERS: Record<string, string> = {
-  Accept: "application/json",
-  "Accept-Encoding": "gzip, deflate, br",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Cache-Control": "no-cache",
-  Pragma: "no-cache",
-  "User-Agent":
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-};
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
 
-function parseTickers(list: BybitTicker[]): MarketTicker[] {
-  return list
-    .filter((t: BybitTicker) => {
-      const price = parseFloat(t.lastPrice);
-      return price > 0 && !isNaN(price);
-    })
-    .map((t: BybitTicker) => {
-      const price = parseFloat(t.lastPrice);
-      const prevPrice = parseFloat(t.prevPrice24h);
-      const changePercent = parseFloat(t.price24hPcnt) * 100;
-      const change24h = price - prevPrice;
-
-      const ticker: MarketTicker = {
-        symbol: t.symbol,
-        price,
-        change24h: isNaN(change24h) ? 0 : change24h,
-        changePercent: isNaN(changePercent) ? 0 : changePercent,
-        high24h: parseFloat(t.highPrice24h) || 0,
-        low24h: parseFloat(t.lowPrice24h) || 0,
-        volume24h: parseFloat(t.volume24h) || 0,
-        turnover24h: parseFloat(t.turnover24h) || 0,
-      };
-
-      if (t.markPrice) ticker.markPrice = parseFloat(t.markPrice);
-      if (t.indexPrice) ticker.indexPrice = parseFloat(t.indexPrice);
-      if (t.openInterest) ticker.openInterest = parseFloat(t.openInterest);
-      if (t.openInterestValue)
-        ticker.openInterestValue = parseFloat(t.openInterestValue);
-      if (t.fundingRate) ticker.fundingRate = parseFloat(t.fundingRate);
-      if (t.nextFundingTime) ticker.nextFundingTime = t.nextFundingTime;
-
-      return ticker;
-    });
+function isStablePair(symbol: string): boolean {
+  for (const stable of STABLE_PATTERN) {
+    if (symbol.endsWith(stable) && symbol !== stable) {
+      const base = symbol.slice(0, -stable.length);
+      if (STABLECOINS.has(base)) return true;
+    }
+  }
+  return false;
 }
 
-async function fetchFromBybitDirect(category: string): Promise<MarketTicker[]> {
-  const url = `${BYBIT_BASE}?category=${category}`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
+function calcChange(current: number, past: number): number {
+  if (past <= 0) return 0;
+  return ((current - past) / past) * 100;
+}
 
+let useProxy = false;
+
+async function bybitFetch(url: string): Promise<unknown> {
+  if (!useProxy) {
+    try {
+      const res = await fetch(url, { headers: REQ_HEADERS });
+      if (res.status === 403) {
+        useProxy = true;
+      } else if (res.ok) {
+        return await res.json();
+      } else {
+        throw new Error(`${res.status} ${res.statusText}`);
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message.includes("403")) {
+        useProxy = true;
+      } else {
+        throw e;
+      }
+    }
+  }
+  const proxyUrl = `${PROXY_API}${encodeURIComponent(url)}`;
+  const res = await fetch(proxyUrl, {
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`Proxy: ${res.status}`);
+  return await res.json();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Concurrency-limited parallel map                                    */
+/* ------------------------------------------------------------------ */
+
+async function concurrentMap<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, idx: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = [];
+  let nextIdx = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIdx < items.length) {
+      const idx = nextIdx++;
+      if (idx < items.length) {
+        results[idx] = await fn(items[idx], idx);
+      }
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Kline helpers                                                      */
+/* ------------------------------------------------------------------ */
+
+interface KlineEntry {
+  symbol: string;
+  candles: string[][] | null;
+}
+
+async function fetchKline(
+  category: string,
+  symbol: string,
+  interval: string,
+  limit: number
+): Promise<string[][] | null> {
   try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: REQUEST_HEADERS,
-    });
-    clearTimeout(timeout);
-
-    if (!res.ok) {
-      throw new Error(`Direct fetch: ${res.status} ${res.statusText}`);
-    }
-
-    const data = await res.json();
-    if (data.retCode !== 0) {
-      throw new Error(`Bybit error: ${data.retMsg} (${data.retCode})`);
-    }
-    if (!data.result?.list || !Array.isArray(data.result.list)) {
-      throw new Error("Invalid response structure");
-    }
-
-    return parseTickers(data.result.list);
-  } catch (error) {
-    clearTimeout(timeout);
-    throw error;
+    const url = `${BYBIT_API}/kline?category=${category}&symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    const data = (await bybitFetch(url)) as {
+      retCode: number;
+      retMsg: string;
+      result?: { list?: string[][] };
+    };
+    if (data.retCode !== 0 || !data.result?.list) return null;
+    return data.result.list;
+  } catch {
+    return null;
   }
 }
 
-async function fetchFromBybitProxy(category: string): Promise<MarketTicker[]> {
-  const targetUrl = `${BYBIT_BASE}?category=${category}`;
-  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
+function extractChanges(
+  price: number,
+  k5: string[][] | null,
+  k60: string[][] | null
+): TimeframeChanges {
+  const changes: TimeframeChanges = {
+    m5: null,
+    m10: null,
+    m15: null,
+    m30: null,
+    h1: null,
+    h12: null,
+    h24: 0,
+  };
 
-  try {
-    const res = await fetch(proxyUrl, {
-      signal: controller.signal,
-      headers: { Accept: "application/json" },
-    });
-    clearTimeout(timeout);
-
-    if (!res.ok) {
-      throw new Error(`Proxy fetch: ${res.status} ${res.statusText}`);
+  // 5m klines → 5m, 10m, 15m, 30m changes
+  if (k5) {
+    if (k5.length >= 2) {
+      const c = parseFloat(k5[1][4]);
+      if (c > 0) changes.m5 = calcChange(price, c);
     }
-
-    const data = await res.json();
-    if (data.retCode !== 0) {
-      throw new Error(`Bybit error: ${data.retMsg} (${data.retCode})`);
+    if (k5.length >= 3) {
+      const c = parseFloat(k5[2][4]);
+      if (c > 0) changes.m10 = calcChange(price, c);
     }
-    if (!data.result?.list || !Array.isArray(data.result.list)) {
-      throw new Error("Invalid response from proxy");
+    if (k5.length >= 4) {
+      const c = parseFloat(k5[3][4]);
+      if (c > 0) changes.m15 = calcChange(price, c);
     }
-
-    return parseTickers(data.result.list);
-  } catch (error) {
-    clearTimeout(timeout);
-    throw error;
+    if (k5.length >= 7) {
+      const c = parseFloat(k5[6][4]);
+      if (c > 0) changes.m30 = calcChange(price, c);
+    }
   }
+
+  // 60m klines → 1h, 12h changes
+  if (k60) {
+    if (k60.length >= 2) {
+      const c = parseFloat(k60[1][4]);
+      if (c > 0) changes.h1 = calcChange(price, c);
+    }
+    if (k60.length >= 13) {
+      const c = parseFloat(k60[12][4]);
+      if (c > 0) changes.h12 = calcChange(price, c);
+    }
+  }
+
+  return changes;
 }
 
-async function fetchBybitTickers(category: string): Promise<MarketTicker[]> {
-  try {
-    return await fetchFromBybitDirect(category);
-  } catch (directError) {
-    console.warn("Direct Bybit fetch failed, trying proxy:", directError);
-    return await fetchFromBybitProxy(category);
-  }
-}
+/* ------------------------------------------------------------------ */
+/*  GET handler                                                        */
+/* ------------------------------------------------------------------ */
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const type = searchParams.get("type") || "spot";
-  const sort = searchParams.get("sort") || "changePercent";
-  const order = searchParams.get("order") || "desc";
-  const limit = parseInt(searchParams.get("limit") || "50", 10);
-  const minVolume = parseFloat(searchParams.get("minVolume") || "0");
 
   if (!["spot", "linear"].includes(type)) {
     return NextResponse.json(
@@ -173,45 +220,110 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const tickers = await fetchBybitTickers(type);
+    // Reset proxy flag for each request
+    useProxy = false;
 
-    let filtered = tickers;
-    if (minVolume > 0) {
-      filtered = tickers.filter((t) => t.turnover24h >= minVolume);
+    // 1. Fetch all tickers
+    const tickerUrl = `${BYBIT_API}/tickers?category=${type}`;
+    const tickerData = (await bybitFetch(tickerUrl)) as {
+      retCode: number;
+      retMsg: string;
+      result?: { list?: Record<string, string>[] };
+    };
+
+    if (tickerData.retCode !== 0) {
+      throw new Error(`Bybit: ${tickerData.retMsg} (${tickerData.retCode})`);
     }
 
-    const validSortFields: (keyof MarketTicker)[] = [
-      "changePercent",
-      "volume24h",
-      "turnover24h",
-      "price",
-      "openInterestValue",
-    ];
-    const sortField = validSortFields.includes(sort as keyof MarketTicker)
-      ? (sort as keyof MarketTicker)
-      : "changePercent";
-    const orderMultiplier = order === "asc" ? 1 : -1;
+    const allTickers = tickerData.result?.list ?? [];
 
-    filtered.sort((a, b) => {
-      const aVal: number = a[sortField] as number ?? 0;
-      const bVal: number = b[sortField] as number ?? 0;
-      return (aVal - bVal) * orderMultiplier;
+    // 2. Filter: >$300K turnover, active price, not stable/stable
+    const MIN_TURNOVER = 300_000;
+    const qualified = allTickers.filter((t) => {
+      const turnover = parseFloat(t.turnover24h || "0");
+      const price = parseFloat(t.lastPrice || "0");
+      return turnover >= MIN_TURNOVER && price > 0 && !isStablePair(t.symbol);
     });
 
-    const limited = filtered.slice(0, limit);
+    if (qualified.length === 0) {
+      return NextResponse.json({
+        type,
+        data: [],
+        count: 0,
+        totalAll: allTickers.length,
+        fetchedAt: new Date().toISOString(),
+      });
+    }
 
-    const gainers = filtered.filter((t) => t.changePercent > 0).length;
-    const losers = filtered.filter((t) => t.changePercent < 0).length;
-    const unchanged = filtered.length - gainers - losers;
+    // 3. Build price map
+    const priceMap = new Map<string, number>();
+    for (const t of qualified) {
+      priceMap.set(t.symbol, parseFloat(t.lastPrice));
+    }
+
+    // 4. Fetch klines in parallel (2 intervals per symbol)
+    const symbols = qualified.map((t) => t.symbol);
+
+    const kline5mResults: KlineEntry[] = await concurrentMap(
+      symbols,
+      15,
+      async (sym) => ({
+        symbol: sym,
+        candles: await fetchKline(type, sym, "5", 7),
+      })
+    );
+
+    const kline60mResults: KlineEntry[] = await concurrentMap(
+      symbols,
+      15,
+      async (sym) => ({
+        symbol: sym,
+        candles: await fetchKline(type, sym, "60", 13),
+      })
+    );
+
+    // 5. Build lookup maps
+    const k5Map = new Map<string, string[][] | null>();
+    for (const r of kline5mResults) k5Map.set(r.symbol, r.candles);
+
+    const k60Map = new Map<string, string[][] | null>();
+    for (const r of kline60mResults) k60Map.set(r.symbol, r.candles);
+
+    // 6. Assemble final data
+    const data: MarketTicker[] = qualified.map((t) => {
+      const symbol = t.symbol;
+      const price = priceMap.get(symbol) || 0;
+      const k5 = k5Map.get(symbol) ?? null;
+      const k60 = k60Map.get(symbol) ?? null;
+
+      const changes = extractChanges(price, k5, k60);
+      changes.h24 = parseFloat(t.price24hPcnt || "0") * 100;
+
+      const ticker: MarketTicker = {
+        symbol,
+        price,
+        turnover24h: parseFloat(t.turnover24h || "0"),
+        changes,
+      };
+
+      // Perpetual-specific
+      if (type === "linear") {
+        const mp = parseFloat(t.markPrice || "0");
+        if (mp > 0) ticker.markPrice = mp;
+        const oi = parseFloat(t.openInterestValue || "0");
+        if (oi > 0) ticker.openInterestValue = oi;
+        const fr = parseFloat(t.fundingRate || "0");
+        if (fr !== 0) ticker.fundingRate = fr;
+      }
+
+      return ticker;
+    });
 
     return NextResponse.json({
       type,
-      count: limited.length,
-      totalFiltered: filtered.length,
-      totalAll: tickers.length,
-      stats: { gainers, losers, unchanged },
-      sort: { field: sortField, order },
-      data: limited,
+      data,
+      count: data.length,
+      totalAll: allTickers.length,
       fetchedAt: new Date().toISOString(),
     });
   } catch (error) {
@@ -219,7 +331,7 @@ export async function GET(request: NextRequest) {
       error instanceof Error ? error.message : "Unknown error occurred";
     return NextResponse.json(
       {
-        error: "Failed to fetch Bybit market data",
+        error: "Failed to fetch market data",
         details: message,
         timestamp: new Date().toISOString(),
       },
