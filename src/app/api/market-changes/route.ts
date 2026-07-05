@@ -1,3 +1,5 @@
+export const runtime = "edge";
+
 import { NextRequest, NextResponse } from "next/server";
 
 const BYBIT_BASE = "https://api.bybit.com/v5/market/tickers";
@@ -38,7 +40,52 @@ export interface MarketTicker {
   nextFundingTime?: string;
 }
 
-async function fetchBybitTickers(category: string): Promise<MarketTicker[]> {
+const REQUEST_HEADERS: Record<string, string> = {
+  Accept: "application/json",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Cache-Control": "no-cache",
+  Pragma: "no-cache",
+  "User-Agent":
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+};
+
+function parseTickers(list: BybitTicker[]): MarketTicker[] {
+  return list
+    .filter((t: BybitTicker) => {
+      const price = parseFloat(t.lastPrice);
+      return price > 0 && !isNaN(price);
+    })
+    .map((t: BybitTicker) => {
+      const price = parseFloat(t.lastPrice);
+      const prevPrice = parseFloat(t.prevPrice24h);
+      const changePercent = parseFloat(t.price24hPcnt) * 100;
+      const change24h = price - prevPrice;
+
+      const ticker: MarketTicker = {
+        symbol: t.symbol,
+        price,
+        change24h: isNaN(change24h) ? 0 : change24h,
+        changePercent: isNaN(changePercent) ? 0 : changePercent,
+        high24h: parseFloat(t.highPrice24h) || 0,
+        low24h: parseFloat(t.lowPrice24h) || 0,
+        volume24h: parseFloat(t.volume24h) || 0,
+        turnover24h: parseFloat(t.turnover24h) || 0,
+      };
+
+      if (t.markPrice) ticker.markPrice = parseFloat(t.markPrice);
+      if (t.indexPrice) ticker.indexPrice = parseFloat(t.indexPrice);
+      if (t.openInterest) ticker.openInterest = parseFloat(t.openInterest);
+      if (t.openInterestValue)
+        ticker.openInterestValue = parseFloat(t.openInterestValue);
+      if (t.fundingRate) ticker.fundingRate = parseFloat(t.fundingRate);
+      if (t.nextFundingTime) ticker.nextFundingTime = t.nextFundingTime;
+
+      return ticker;
+    });
+}
+
+async function fetchFromBybitDirect(category: string): Promise<MarketTicker[]> {
   const url = `${BYBIT_BASE}?category=${category}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
@@ -46,83 +93,78 @@ async function fetchBybitTickers(category: string): Promise<MarketTicker[]> {
   try {
     const res = await fetch(url, {
       signal: controller.signal,
-      headers: {
-        Accept: "application/json",
-      },
-      next: { revalidate: 0 },
+      headers: REQUEST_HEADERS,
     });
-
     clearTimeout(timeout);
 
     if (!res.ok) {
-      throw new Error(`Bybit API returned ${res.status} ${res.statusText}`);
+      throw new Error(`Direct fetch: ${res.status} ${res.statusText}`);
     }
 
     const data = await res.json();
-
     if (data.retCode !== 0) {
-      throw new Error(`Bybit API error: ${data.retMsg} (code: ${data.retCode})`);
+      throw new Error(`Bybit error: ${data.retMsg} (${data.retCode})`);
     }
-
     if (!data.result?.list || !Array.isArray(data.result.list)) {
-      throw new Error("Invalid response structure from Bybit API");
+      throw new Error("Invalid response structure");
     }
 
-    const tickers: MarketTicker[] = data.result.list
-      .filter((t: BybitTicker) => {
-        // Filter out inactive pairs with no trading data
-        const price = parseFloat(t.lastPrice);
-        const vol = parseFloat(t.volume24h);
-        return price > 0 && !isNaN(price);
-      })
-      .map((t: BybitTicker) => {
-        const price = parseFloat(t.lastPrice);
-        const prevPrice = parseFloat(t.prevPrice24h);
-        const changePercent = parseFloat(t.price24hPcnt) * 100; // decimal to percentage
-        const change24h = price - prevPrice;
-
-        const ticker: MarketTicker = {
-          symbol: t.symbol,
-          price,
-          change24h: isNaN(change24h) ? 0 : change24h,
-          changePercent: isNaN(changePercent) ? 0 : changePercent,
-          high24h: parseFloat(t.highPrice24h) || 0,
-          low24h: parseFloat(t.lowPrice24h) || 0,
-          volume24h: parseFloat(t.volume24h) || 0,
-          turnover24h: parseFloat(t.turnover24h) || 0,
-        };
-
-        // Derivatives-specific fields (linear/perpetual)
-        if (t.markPrice) ticker.markPrice = parseFloat(t.markPrice);
-        if (t.indexPrice) ticker.indexPrice = parseFloat(t.indexPrice);
-        if (t.openInterest) ticker.openInterest = parseFloat(t.openInterest);
-        if (t.openInterestValue)
-          ticker.openInterestValue = parseFloat(t.openInterestValue);
-        if (t.fundingRate) ticker.fundingRate = parseFloat(t.fundingRate);
-        if (t.nextFundingTime) ticker.nextFundingTime = t.nextFundingTime;
-
-        return ticker;
-      });
-
-    return tickers;
+    return parseTickers(data.result.list);
   } catch (error) {
     clearTimeout(timeout);
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("Request to Bybit API timed out after 10 seconds");
-    }
     throw error;
+  }
+}
+
+async function fetchFromBybitProxy(category: string): Promise<MarketTicker[]> {
+  const targetUrl = `${BYBIT_BASE}?category=${category}`;
+  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const res = await fetch(proxyUrl, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" },
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      throw new Error(`Proxy fetch: ${res.status} ${res.statusText}`);
+    }
+
+    const data = await res.json();
+    if (data.retCode !== 0) {
+      throw new Error(`Bybit error: ${data.retMsg} (${data.retCode})`);
+    }
+    if (!data.result?.list || !Array.isArray(data.result.list)) {
+      throw new Error("Invalid response from proxy");
+    }
+
+    return parseTickers(data.result.list);
+  } catch (error) {
+    clearTimeout(timeout);
+    throw error;
+  }
+}
+
+async function fetchBybitTickers(category: string): Promise<MarketTicker[]> {
+  try {
+    return await fetchFromBybitDirect(category);
+  } catch (directError) {
+    console.warn("Direct Bybit fetch failed, trying proxy:", directError);
+    return await fetchFromBybitProxy(category);
   }
 }
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
-  const type = searchParams.get("type") || "spot"; // spot | linear
-  const sort = searchParams.get("sort") || "changePercent"; // changePercent | volume24h | turnover24h
-  const order = searchParams.get("order") || "desc"; // desc | asc
+  const type = searchParams.get("type") || "spot";
+  const sort = searchParams.get("sort") || "changePercent";
+  const order = searchParams.get("order") || "desc";
   const limit = parseInt(searchParams.get("limit") || "50", 10);
   const minVolume = parseFloat(searchParams.get("minVolume") || "0");
 
-  // Validate type
   if (!["spot", "linear"].includes(type)) {
     return NextResponse.json(
       { error: "Invalid type. Use 'spot' or 'linear'." },
@@ -133,13 +175,11 @@ export async function GET(request: NextRequest) {
   try {
     const tickers = await fetchBybitTickers(type);
 
-    // Filter by minimum volume if specified
     let filtered = tickers;
     if (minVolume > 0) {
       filtered = tickers.filter((t) => t.turnover24h >= minVolume);
     }
 
-    // Sort
     const validSortFields: (keyof MarketTicker)[] = [
       "changePercent",
       "volume24h",
@@ -153,15 +193,13 @@ export async function GET(request: NextRequest) {
     const orderMultiplier = order === "asc" ? 1 : -1;
 
     filtered.sort((a, b) => {
-      const aVal = a[sortField] ?? 0;
-      const bVal = b[sortField] ?? 0;
+      const aVal: number = a[sortField] as number ?? 0;
+      const bVal: number = b[sortField] as number ?? 0;
       return (aVal - bVal) * orderMultiplier;
     });
 
-    // Limit
     const limited = filtered.slice(0, limit);
 
-    // Compute summary stats
     const gainers = filtered.filter((t) => t.changePercent > 0).length;
     const losers = filtered.filter((t) => t.changePercent < 0).length;
     const unchanged = filtered.length - gainers - losers;
