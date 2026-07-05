@@ -153,8 +153,8 @@ export async function GET(request: NextRequest) {
     const orderMultiplier = order === "asc" ? 1 : -1;
 
     filtered.sort((a, b) => {
-      const aVal = a[sortField] ?? 0;
-      const bVal = b[sortField] ?? 0;
+    const aVal: number = a[sortField] as number ?? 0;
+    const bVal: number = b[sortField] as number ?? 0;
       return (aVal - bVal) * orderMultiplier;
     });
 
