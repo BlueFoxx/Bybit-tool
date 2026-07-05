@@ -306,8 +306,8 @@ export default function Home() {
     // Sort client-side
     const orderMul = sortOrder === "desc" ? -1 : 1;
     filtered = [...filtered].sort((a, b) => {
-      const aVal = (a as Record<string, unknown>)[sortField] as number ?? 0;
-      const bVal = (b as Record<string, unknown>)[sortField] as number ?? 0;
+      const aVal = (a as unknown as Record<string, number>)[sortField] ?? 0;
+      const bVal = (b as unknown as Record<string, number>)[sortField] ?? 0;
       return (aVal - bVal) * orderMul;
     });
 
