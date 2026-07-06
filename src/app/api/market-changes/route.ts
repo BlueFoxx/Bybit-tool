@@ -43,6 +43,7 @@ export interface MarketTicker {
   price: number;
   turnover24h: number;
   changes: TimeframeChanges;
+  sparkline: number[];
   markPrice?: number;
   openInterestValue?: number;
   fundingRate?: number;
@@ -303,11 +304,24 @@ export async function GET(request: NextRequest) {
       const changes = extractChanges(price, k5, k60);
       changes.h24 = parseFloat(t.price24hPcnt || "0") * 100;
 
+      // Sparkline: 60m close prices in ascending time order (oldest → newest)
+      let sparkline: number[] = [];
+      if (k60 && k60.length >= 2) {
+        const sorted60 = sortKlinesDesc(k60);
+        sparkline = sorted60
+          .slice()
+          .reverse()
+          .map((c) => parseFloat(c[4]));
+        // Replace last point with live price for accuracy
+        if (sparkline.length > 0) sparkline[sparkline.length - 1] = price;
+      }
+
       const ticker: MarketTicker = {
         symbol,
         price,
         turnover24h: parseFloat(t.turnover24h || "0"),
         changes,
+        sparkline,
       };
 
       // Perpetual-specific
