@@ -154,6 +154,11 @@ async function fetchKline(
   }
 }
 
+/* Sort klines by startTime descending (newest first) for reliable indexing */
+function sortKlinesDesc(klines: string[][]): string[][] {
+  return [...klines].sort((a, b) => Number(b[0]) - Number(a[0]));
+}
+
 function extractChanges(
   price: number,
   k5: string[][] | null,
@@ -170,33 +175,32 @@ function extractChanges(
   };
 
   // 5m klines → 5m, 10m, 15m, 30m changes
-  if (k5) {
-    if (k5.length >= 2) {
-      const c = parseFloat(k5[1][4]);
-      if (c > 0) changes.m5 = calcChange(price, c);
-    }
-    if (k5.length >= 3) {
-      const c = parseFloat(k5[2][4]);
+  // Ensure descending order (newest first) so indices map to correct timeframes
+  if (k5 && k5.length >= 2) {
+    const sorted = sortKlinesDesc(k5);
+    const c5 = parseFloat(sorted[1][4]);
+    if (c5 > 0) changes.m5 = calcChange(price, c5);
+    if (sorted.length >= 3) {
+      const c = parseFloat(sorted[2][4]);
       if (c > 0) changes.m10 = calcChange(price, c);
     }
-    if (k5.length >= 4) {
-      const c = parseFloat(k5[3][4]);
+    if (sorted.length >= 4) {
+      const c = parseFloat(sorted[3][4]);
       if (c > 0) changes.m15 = calcChange(price, c);
     }
-    if (k5.length >= 7) {
-      const c = parseFloat(k5[6][4]);
+    if (sorted.length >= 7) {
+      const c = parseFloat(sorted[6][4]);
       if (c > 0) changes.m30 = calcChange(price, c);
     }
   }
 
   // 60m klines → 1h, 12h changes
-  if (k60) {
-    if (k60.length >= 2) {
-      const c = parseFloat(k60[1][4]);
-      if (c > 0) changes.h1 = calcChange(price, c);
-    }
-    if (k60.length >= 13) {
-      const c = parseFloat(k60[12][4]);
+  if (k60 && k60.length >= 2) {
+    const sorted = sortKlinesDesc(k60);
+    const c1 = parseFloat(sorted[1][4]);
+    if (c1 > 0) changes.h1 = calcChange(price, c1);
+    if (sorted.length >= 13) {
+      const c = parseFloat(sorted[12][4]);
       if (c > 0) changes.h12 = calcChange(price, c);
     }
   }
