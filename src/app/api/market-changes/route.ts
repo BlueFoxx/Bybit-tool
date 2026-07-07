@@ -243,12 +243,16 @@ export async function GET(request: NextRequest) {
 
     const allTickers = tickerData.result?.list ?? [];
 
-    // 2. Filter: >$300K turnover, active price, not stable/stable
+    // 2. Filter: USDT pairs only, >$300K turnover, active price
     const MIN_TURNOVER = 300_000;
     const qualified = allTickers.filter((t) => {
       const turnover = parseFloat(t.turnover24h || "0");
       const price = parseFloat(t.lastPrice || "0");
-      return turnover >= MIN_TURNOVER && price > 0 && !isStablePair(t.symbol);
+      return (
+        t.symbol.endsWith("USDT") &&
+        turnover >= MIN_TURNOVER &&
+        price > 0
+      );
     });
 
     if (qualified.length === 0) {
