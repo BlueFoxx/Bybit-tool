@@ -216,6 +216,7 @@ function extractChanges(
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const type = searchParams.get("type") || "spot";
+  const pricesOnly = searchParams.get("pricesOnly") === "true";
 
   if (!["spot", "linear"].includes(type)) {
     return NextResponse.json(
@@ -255,6 +256,43 @@ export async function GET(request: NextRequest) {
         type,
         data: [],
         count: 0,
+        totalAll: allTickers.length,
+        fetchedAt: new Date().toISOString(),
+      });
+    }
+
+    /* ---- Fast path: return prices only (no kline fetches) ---- */
+    if (pricesOnly) {
+      const quickData: MarketTicker[] = qualified.map((t) => {
+        const ticker: MarketTicker = {
+          symbol: t.symbol,
+          price: parseFloat(t.lastPrice),
+          turnover24h: parseFloat(t.turnover24h || "0"),
+          changes: {
+            m5: null,
+            m10: null,
+            m15: null,
+            m30: null,
+            h1: null,
+            h12: null,
+            h24: parseFloat(t.price24hPcnt || "0") * 100,
+          },
+          sparkline: [],
+        };
+        if (type === "linear") {
+          const mp = parseFloat(t.markPrice || "0");
+          if (mp > 0) ticker.markPrice = mp;
+          const oi = parseFloat(t.openInterestValue || "0");
+          if (oi > 0) ticker.openInterestValue = oi;
+          const fr = parseFloat(t.fundingRate || "0");
+          if (fr !== 0) ticker.fundingRate = fr;
+        }
+        return ticker;
+      });
+      return NextResponse.json({
+        type,
+        data: quickData,
+        count: quickData.length,
         totalAll: allTickers.length,
         fetchedAt: new Date().toISOString(),
       });
