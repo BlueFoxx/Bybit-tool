@@ -12,6 +12,8 @@ import {
   BarChart3,
   Clock,
   Loader2,
+  LineChart,
+  FlaskConical,
 } from "lucide-react";
 import {
   Tabs,
@@ -33,6 +35,11 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import SimulatedTrading from "@/components/SimulatedTrading";
+import BottomAlertsFeed from "@/components/BottomAlertsFeed";
+import BottomMiniChart from "@/components/BottomMiniChart";
+import BacktestPanel from "@/components/BacktestPanel";
+import { useBottomDetector } from "@/lib/useBottomDetector";
+import type { BottomEvent } from "@/lib/rolling-buffer";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -70,6 +77,7 @@ interface ApiResponse {
 }
 
 type MarketType = "spot" | "linear";
+type ViewMode = "live" | "backtest";
 type SortField =
   | "changes.m5"
   | "changes.m10"
@@ -307,6 +315,7 @@ function SkeletonRows({ count = 12, colCount = 10 }: { count?: number; colCount?
 
 export default function Home() {
   const [marketType, setMarketType] = useState<MarketType>("spot");
+  const [viewMode, setViewMode] = useState<ViewMode>("live");
   const [searchQuery, setSearchQuery] = useState("");
   const [sortField, setSortField] = useState<SortField>("changes.h24");
   const [sortOrder, setSortOrder] = useState<SortOrder>("desc");
@@ -319,6 +328,34 @@ export default function Home() {
   const [countdown, setCountdown] = useState(60);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isPerp = marketType === "linear";
+
+  // Bottom-detector UI state
+  const [soundEnabled, setSoundEnabled] = useState(true);
+  const [toastEnabled, setToastEnabled] = useState(true);
+  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+  const [selectedEvent, setSelectedEvent] = useState<BottomEvent | null>(null);
+
+  // Wire the bottom-detector into the live data stream
+  const {
+    events: bottomEvents,
+    activeSymbols: bottomActiveSymbols,
+    totalEmitted: bottomTotalEmitted,
+    registry: bottomRegistry,
+    clearEvents: clearBottomEvents,
+  } = useBottomDetector(data, {
+    soundEnabled,
+    toastEnabled,
+    toastThreshold: 70,
+  });
+
+  // Request notification permission on mount
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!("Notification" in window)) return;
+    if (Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+  }, []);
 
   // Cache per-tab data so switching back is instant
   const tabCache = useRef<Map<MarketType, MarketTicker[]>>(new Map());
@@ -573,6 +610,35 @@ export default function Home() {
                 </p>
               </div>
             </div>
+            <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+              {/* View mode toggle */}
+              <div className="flex items-center gap-0.5 bg-secondary/50 rounded-md p-0.5 border border-border/40">
+                <button
+                  onClick={() => setViewMode("live")}
+                  className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${
+                    viewMode === "live"
+                      ? "bg-amber-500/15 text-amber-400"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                  title="Live tracking"
+                >
+                  <LineChart className="h-3 w-3" />
+                  <span className="hidden sm:inline">Live</span>
+                </button>
+                <button
+                  onClick={() => setViewMode("backtest")}
+                  className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${
+                    viewMode === "backtest"
+                      ? "bg-amber-500/15 text-amber-400"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                  title="Backtest the bottom-detector on historical data"
+                >
+                  <FlaskConical className="h-3 w-3" />
+                  <span className="hidden sm:inline">Backtest</span>
+                </button>
+              </div>
+            </div>
             <div className="flex items-center gap-2 sm:gap-3 shrink-0">
               {fetchedAt && !error && (
                 <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -627,6 +693,33 @@ export default function Home() {
       </header>
 
       <main className="flex-1 max-w-[1600px] w-full mx-auto px-4 sm:px-6 py-4 sm:py-6 space-y-4 sm:space-y-6">
+        {/* ---- BACKTEST MODE ---- */}
+        {viewMode === "backtest" && (
+          <div className="space-y-4">
+            <div>
+              <h2 className="text-lg font-bold tracking-tight flex items-center gap-2">
+                <FlaskConical className="h-5 w-5 text-amber-400" />
+                Bottom-Detector Backtest
+              </h2>
+              <p className="text-xs text-muted-foreground mt-1">
+                Replay historical candles through the same bottom-detector rule
+                engine used in live mode. Tweak TP/SL to find configs that would
+                have caught real bottoms.
+              </p>
+            </div>
+            <BacktestPanel
+              defaultSymbol={selectedSymbol || "BTCUSDT"}
+              marketType={marketType}
+            />
+          </div>
+        )}
+
+        {/* ---- LIVE MODE ---- */}
+        {viewMode === "live" && (
+        <>
+        <div className="flex flex-col xl:flex-row gap-4 sm:gap-6">
+          {/* Main column: table + simulator */}
+          <div className="flex-1 min-w-0 space-y-4 sm:space-y-6">
         {/* ---- MARKET TYPE TABS + SEARCH ---- */}
         <Tabs
           value={marketType}
@@ -845,13 +938,29 @@ export default function Home() {
                     !loading &&
                     displayData.map((ticker, idx) => {
                       const [base, quote] = extractBase(ticker.symbol);
+                      const hasBottomSignal = bottomActiveSymbols.has(ticker.symbol);
                       return (
                         <TableRow
                           key={ticker.symbol}
-                          className="border-border/30 group"
+                          className={`border-border/30 group cursor-pointer hover:bg-muted/20 ${
+                            hasBottomSignal ? "bg-amber-500/[0.04]" : ""
+                          }`}
+                          onClick={() => {
+                            setSelectedSymbol(ticker.symbol);
+                            setSelectedEvent(
+                              bottomEvents.find((e) => e.symbol === ticker.symbol) ?? null
+                            );
+                          }}
                         >
                           <TableCell className="text-center text-xs text-muted-foreground font-mono tabular-nums">
-                            {idx + 1}
+                            {hasBottomSignal ? (
+                              <span className="relative flex h-2 w-2 mx-auto" title="Active bottom signal">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
+                                <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500" />
+                              </span>
+                            ) : (
+                              idx + 1
+                            )}
                           </TableCell>
                           <TableCell>
                             <div className="flex items-center gap-1.5">
@@ -862,6 +971,14 @@ export default function Home() {
                                 <span className="text-xs text-muted-foreground">
                                   /{quote}
                                 </span>
+                              )}
+                              {hasBottomSignal && (
+                                <Badge
+                                  variant="outline"
+                                  className="text-[8px] px-1 py-0 ml-1 border-amber-500/40 text-amber-400"
+                                >
+                                  BOTTOM
+                                </Badge>
                               )}
                             </div>
                           </TableCell>
@@ -973,7 +1090,55 @@ export default function Home() {
               </Card>
             ))}
         {/* ---- SIMULATED TRADING ---- */}
-        <SimulatedTrading data={data} marketType={marketType} />
+        <SimulatedTrading data={data} marketType={marketType} bottomEvents={bottomEvents} />
+          </div>
+
+          {/* Right sidebar: alerts feed */}
+          <div className="xl:w-80 shrink-0">
+            <BottomAlertsFeed
+              events={bottomEvents}
+              totalEmitted={bottomTotalEmitted}
+              onClear={clearBottomEvents}
+              soundEnabled={soundEnabled}
+              toastEnabled={toastEnabled}
+              onToggleSound={() => setSoundEnabled((p) => !p)}
+              onToggleToast={() => setToastEnabled((p) => !p)}
+              onSelectEvent={(e) => {
+                setSelectedSymbol(e.symbol);
+                setSelectedEvent(e);
+              }}
+              onSelectSymbol={(s) => {
+                setSelectedSymbol(s);
+                setSearchQuery(s);
+              }}
+            />
+          </div>
+        </div>
+
+        {/* Mini-chart popover */}
+        {selectedSymbol && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4"
+            onClick={() => {
+              setSelectedSymbol(null);
+              setSelectedEvent(null);
+            }}
+          >
+            <div onClick={(e) => e.stopPropagation()} className="max-w-full">
+              <BottomMiniChart
+                symbol={selectedSymbol}
+                registry={bottomRegistry}
+                triggerEvent={selectedEvent}
+                onClose={() => {
+                  setSelectedSymbol(null);
+                  setSelectedEvent(null);
+                }}
+              />
+            </div>
+          </div>
+        )}
+        </>
+        )}
       </main>
 
       {/* ---- FOOTER ---- */}
@@ -982,7 +1147,8 @@ export default function Home() {
           <span>
             Market data from{" "}
             <span className="text-foreground font-medium">Bybit</span> ·
-            Prices live (10s) · Timeframes & sparklines (60s)
+            Prices live (10s) · Timeframes &amp; sparklines (60s) ·
+            Bottom-detector (adaptive 1m/15s)
           </span>
           <span className="font-mono tabular-nums">
             {fetchedAt

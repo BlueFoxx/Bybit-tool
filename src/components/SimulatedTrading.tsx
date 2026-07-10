@@ -8,6 +8,7 @@ import {
   Trash2,
   ChevronDown,
   RotateCcw,
+  TrendingUp,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -20,6 +21,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import type { BottomEvent } from "@/lib/rolling-buffer";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -28,8 +30,12 @@ import {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type TickerData = any;
 
+type SlotMode = "threshold" | "bottom";
+
 interface SlotConfig {
   id: number;
+  /** "threshold" = classic Buy ≥% mode; "bottom" = bottom-detector mode */
+  mode: SlotMode;
   timeframe: string;
   buyThreshold: number;
   takeProfitPct: number;
@@ -37,6 +43,8 @@ interface SlotConfig {
   orderSize: number;
   maxPositions: number;
   enabled: boolean;
+  /** For "bottom" mode: minimum severity (0-100) to act on */
+  minSeverity: number;
 }
 
 interface SimPosition {
@@ -95,6 +103,7 @@ const TF_SHORT: Record<string, string> = {
 const DEFAULT_SLOTS: SlotConfig[] = [
   {
     id: 1,
+    mode: "threshold",
     timeframe: "m5",
     buyThreshold: 3,
     takeProfitPct: 2,
@@ -102,9 +111,11 @@ const DEFAULT_SLOTS: SlotConfig[] = [
     orderSize: 1000,
     maxPositions: 5,
     enabled: false,
+    minSeverity: 60,
   },
   {
     id: 2,
+    mode: "threshold",
     timeframe: "h1",
     buyThreshold: 5,
     takeProfitPct: 3,
@@ -112,16 +123,19 @@ const DEFAULT_SLOTS: SlotConfig[] = [
     orderSize: 1000,
     maxPositions: 5,
     enabled: false,
+    minSeverity: 60,
   },
   {
     id: 3,
-    timeframe: "h24",
-    buyThreshold: 8,
-    takeProfitPct: 5,
-    stopLossPct: 3,
+    mode: "bottom",
+    timeframe: "m5",
+    buyThreshold: 0,
+    takeProfitPct: 3,
+    stopLossPct: 2,
     orderSize: 1000,
     maxPositions: 5,
     enabled: false,
+    minSeverity: 65,
   },
 ];
 
@@ -182,9 +196,12 @@ function pnlColor(n: number): string {
 export default function SimulatedTrading({
   data,
   marketType,
+  bottomEvents,
 }: {
   data: TickerData[];
   marketType: string;
+  /** Recent bottom-detector events, newest first */
+  bottomEvents?: BottomEvent[];
 }) {
   /* ---- State ---- */
   const [masterEnabled, setMasterEnabled] = useState(false);
@@ -203,6 +220,11 @@ export default function SimulatedTrading({
   masterRef.current = masterEnabled;
   const slotsRef = useRef(slots);
   slotsRef.current = slots;
+
+  /* ---- Track which bottom events we've already processed (dedup) ---- */
+  const processedEventIds = useRef<Set<string>>(new Set());
+  const bottomEventsRef = useRef<BottomEvent[]>([]);
+  bottomEventsRef.current = bottomEvents ?? [];
 
   /* ---- Price lookup ---- */
   const priceMap = useMemo(() => {
@@ -263,54 +285,105 @@ export default function SimulatedTrading({
       if (openForSlot.length >= slot.maxPositions) continue;
 
       const openSymbols = new Set(openForSlot.map((p) => p.symbol));
-      const candidates = data
-        .filter((t) => {
-          if (openSymbols.has(t.symbol)) return false;
-          const ch = getChange(t, slot.timeframe);
-          return ch !== null && ch >= slot.buyThreshold;
-        })
-        .sort(
-          (a, b) =>
-            (getChange(b, slot.timeframe) ?? 0) -
-            (getChange(a, slot.timeframe) ?? 0)
+
+      if (slot.mode === "bottom") {
+        /* --- Bottom-detector mode: consume new events --- */
+        const newEvents = bottomEventsRef.current.filter(
+          (e) =>
+            !processedEventIds.current.has(`${slot.id}:${e.symbol}:${e.timestamp}`) &&
+            e.severity >= slot.minSeverity &&
+            !openSymbols.has(e.symbol)
         );
 
-      const toBuy = candidates.slice(
-        0,
-        slot.maxPositions - openForSlot.length
-      );
+        // Sort by severity descending so we take the strongest signals first
+        newEvents.sort((a, b) => b.severity - a.severity);
 
-      for (const t of toBuy) {
-        const qty = slot.orderSize / t.price;
-        sim.positions.push({
-          id: sim.nextId++,
-          symbol: t.symbol,
-          slotId: slot.id,
-          entryPrice: t.price,
-          entryTime: new Date().toISOString(),
-          quantity: qty,
-        });
-        sim.tradeLog.unshift({
-          id: sim.nextId++,
-          symbol: t.symbol,
-          slotId: slot.id,
-          side: "BUY",
-          price: t.price,
-          quantity: qty,
-          time: new Date().toISOString(),
-          pnl: 0,
-          reason: "trigger",
-        });
-        changed = true;
+        const slotsLeft = slot.maxPositions - openForSlot.length;
+        const toActOn = newEvents.slice(0, slotsLeft);
+
+        for (const e of toActOn) {
+          processedEventIds.current.add(`${slot.id}:${e.symbol}:${e.timestamp}`);
+          const ticker = data.find((t) => t.symbol === e.symbol);
+          const price = ticker?.price ?? e.price;
+          const qty = slot.orderSize / price;
+          sim.positions.push({
+            id: sim.nextId++,
+            symbol: e.symbol,
+            slotId: slot.id,
+            entryPrice: price,
+            entryTime: new Date().toISOString(),
+            quantity: qty,
+          });
+          sim.tradeLog.unshift({
+            id: sim.nextId++,
+            symbol: e.symbol,
+            slotId: slot.id,
+            side: "BUY",
+            price,
+            quantity: qty,
+            time: new Date().toISOString(),
+            pnl: 0,
+            reason: "trigger",
+          });
+          changed = true;
+        }
+      } else {
+        /* --- Classic threshold mode --- */
+        const candidates = data
+          .filter((t) => {
+            if (openSymbols.has(t.symbol)) return false;
+            const ch = getChange(t, slot.timeframe);
+            return ch !== null && ch >= slot.buyThreshold;
+          })
+          .sort(
+            (a, b) =>
+              (getChange(b, slot.timeframe) ?? 0) -
+              (getChange(a, slot.timeframe) ?? 0)
+          );
+
+        const toBuy = candidates.slice(
+          0,
+          slot.maxPositions - openForSlot.length
+        );
+
+        for (const t of toBuy) {
+          const qty = slot.orderSize / t.price;
+          sim.positions.push({
+            id: sim.nextId++,
+            symbol: t.symbol,
+            slotId: slot.id,
+            entryPrice: t.price,
+            entryTime: new Date().toISOString(),
+            quantity: qty,
+          });
+          sim.tradeLog.unshift({
+            id: sim.nextId++,
+            symbol: t.symbol,
+            slotId: slot.id,
+            side: "BUY",
+            price: t.price,
+            quantity: qty,
+            time: new Date().toISOString(),
+            pnl: 0,
+            reason: "trigger",
+          });
+          changed = true;
+        }
       }
     }
 
     /* Trim log to last 500 */
     if (sim.tradeLog.length > 500) sim.tradeLog.length = 500;
 
+    // Trim processedEventIds to last 500 entries (defensive)
+    if (processedEventIds.current.size > 500) {
+      const arr = Array.from(processedEventIds.current);
+      processedEventIds.current = new Set(arr.slice(-500));
+    }
+
     if (changed) setSimVersion((v) => v + 1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data, priceMap, marketType]);
+  }, [data, priceMap, marketType, bottomEvents]);
 
   /* ================================================================ */
   /*  Memoized calculations                                            */
@@ -587,6 +660,15 @@ export default function SimulatedTrading({
                         <span className="text-xs font-medium">
                           Slot {slot.id}
                         </span>
+                        {slot.mode === "bottom" && (
+                          <Badge
+                            variant="outline"
+                            className="text-[9px] px-1 py-0 ml-1 border-amber-500/40 text-amber-400"
+                          >
+                            <TrendingUp className="h-2.5 w-2.5 mr-0.5" />
+                            BOTTOM
+                          </Badge>
+                        )}
                       </div>
                       <span
                         className={`text-xs font-bold tabular-nums ${pnlColor(slotPnl)}`}
@@ -595,47 +677,102 @@ export default function SimulatedTrading({
                       </span>
                     </div>
 
-                    {/* Inputs grid */}
+                    {/* Mode selector */}
+                    <div className="flex gap-1">
+                      <button
+                        onClick={() =>
+                          updateSlot(slot.id, "mode", "threshold")
+                        }
+                        disabled={!slot.enabled}
+                        className={`flex-1 text-[10px] py-1 rounded border transition-colors ${
+                          slot.mode === "threshold"
+                            ? "bg-amber-500/15 border-amber-500/40 text-amber-400"
+                            : "bg-background border-border text-muted-foreground hover:text-foreground"
+                        } disabled:opacity-40`}
+                      >
+                        Buy &ge;%
+                      </button>
+                      <button
+                        onClick={() => updateSlot(slot.id, "mode", "bottom")}
+                        disabled={!slot.enabled}
+                        className={`flex-1 text-[10px] py-1 rounded border transition-colors ${
+                          slot.mode === "bottom"
+                            ? "bg-amber-500/15 border-amber-500/40 text-amber-400"
+                            : "bg-background border-border text-muted-foreground hover:text-foreground"
+                        } disabled:opacity-40`}
+                      >
+                        Bottom
+                      </button>
+                    </div>
+
+                    {/* Inputs grid — adapts to mode */}
                     <div className="grid grid-cols-3 gap-1.5">
-                      <div>
-                        <label className="block text-[9px] text-muted-foreground uppercase tracking-wider mb-0.5">
-                          TF
-                        </label>
-                        <select
-                          value={slot.timeframe}
-                          onChange={(e) =>
-                            updateSlot(slot.id, "timeframe", e.target.value)
-                          }
-                          disabled={!slot.enabled}
-                          className="w-full bg-background border border-border rounded px-1.5 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-amber-500/50 disabled:opacity-40"
-                        >
-                          {TIMEFRAMES.map((tf) => (
-                            <option key={tf.value} value={tf.value}>
-                              {tf.label}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="block text-[9px] text-muted-foreground uppercase tracking-wider mb-0.5">
-                          Buy &ge;%
-                        </label>
-                        <input
-                          type="number"
-                          value={slot.buyThreshold}
-                          onChange={(e) =>
-                            updateSlot(
-                              slot.id,
-                              "buyThreshold",
-                              parseFloat(e.target.value) || 0
-                            )
-                          }
-                          disabled={!slot.enabled}
-                          step="0.5"
-                          min="0"
-                          className="w-full bg-background border border-border rounded px-1.5 py-1 text-xs tabular-nums focus:outline-none focus:ring-1 focus:ring-amber-500/50 disabled:opacity-40"
-                        />
-                      </div>
+                      {slot.mode === "threshold" && (
+                        <>
+                          <div>
+                            <label className="block text-[9px] text-muted-foreground uppercase tracking-wider mb-0.5">
+                              TF
+                            </label>
+                            <select
+                              value={slot.timeframe}
+                              onChange={(e) =>
+                                updateSlot(slot.id, "timeframe", e.target.value)
+                              }
+                              disabled={!slot.enabled}
+                              className="w-full bg-background border border-border rounded px-1.5 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-amber-500/50 disabled:opacity-40"
+                            >
+                              {TIMEFRAMES.map((tf) => (
+                                <option key={tf.value} value={tf.value}>
+                                  {tf.label}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-[9px] text-muted-foreground uppercase tracking-wider mb-0.5">
+                              Buy &ge;%
+                            </label>
+                            <input
+                              type="number"
+                              value={slot.buyThreshold}
+                              onChange={(e) =>
+                                updateSlot(
+                                  slot.id,
+                                  "buyThreshold",
+                                  parseFloat(e.target.value) || 0
+                                )
+                              }
+                              disabled={!slot.enabled}
+                              step="0.5"
+                              min="0"
+                              className="w-full bg-background border border-border rounded px-1.5 py-1 text-xs tabular-nums focus:outline-none focus:ring-1 focus:ring-amber-500/50 disabled:opacity-40"
+                            />
+                          </div>
+                        </>
+                      )}
+                      {slot.mode === "bottom" && (
+                        <div className="col-span-2">
+                          <label className="block text-[9px] text-muted-foreground uppercase tracking-wider mb-0.5">
+                            Min Severity (0-100)
+                          </label>
+                          <input
+                            type="number"
+                            value={slot.minSeverity}
+                            onChange={(e) =>
+                              updateSlot(
+                                slot.id,
+                                "minSeverity",
+                                Math.max(0, Math.min(100, parseFloat(e.target.value) || 0))
+                              )
+                            }
+                            disabled={!slot.enabled}
+                            step="5"
+                            min="0"
+                            max="100"
+                            className="w-full bg-background border border-border rounded px-1.5 py-1 text-xs tabular-nums focus:outline-none focus:ring-1 focus:ring-amber-500/50 disabled:opacity-40"
+                          />
+                        </div>
+                      )}
                       <div>
                         <label className="block text-[9px] text-muted-foreground uppercase tracking-wider mb-0.5">
                           TP %
